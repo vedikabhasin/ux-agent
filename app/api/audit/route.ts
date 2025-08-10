@@ -1,154 +1,138 @@
-import { NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
 import { generateText } from "ai"
 import { openai } from "@ai-sdk/openai"
-import * as cheerio from "cheerio"
-import type { AuditResult } from "@/lib/types"
+import { normalizeInputToUrl } from "@/lib/validation"
 
-// Helper to safely extract JSON object from model output
-function extractJson(text: string): any {
-  const first = text.indexOf("{")
-  const last = text.lastIndexOf("}")
-  if (first === -1 || last === -1 || last <= first) throw new Error("Model did not return JSON.")
-  const jsonStr = text.slice(first, last + 1)
-  return JSON.parse(jsonStr)
+const MAX_HTML_CHARS = 20000
+
+function stripTags(html: string): string {
+  try {
+    // Remove scripts/styles and tags to get a rough text snapshot
+    const noScripts = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "")
+    const text = noScripts
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+    return text
+  } catch {
+    return ""
+  }
 }
 
-export async function POST(req: Request) {
+function truncateMiddle(input: string, max: number): string {
+  if (input.length <= max) return input
+  const half = Math.floor(max / 2)
+  return input.slice(0, half) + "\n...[truncated]...\n" + input.slice(-half)
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const { url } = (await req.json()) as { url?: string }
-    if (!url) {
-      return NextResponse.json({ error: "Missing url" }, { status: 400 })
+    const body = await req.json()
+    const input: string | undefined = body?.input
+    if (!input || typeof input !== "string") {
+      return NextResponse.json({ ok: false, error: "Missing input." }, { status: 400 })
     }
 
-    let parsed: URL
-    try {
-      parsed = new URL(url)
-      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid protocol")
-    } catch {
-      return NextResponse.json({ error: "Invalid URL" }, { status: 400 })
+    const norm = normalizeInputToUrl(input)
+    if (!norm.ok) {
+      return NextResponse.json({ ok: false, error: norm.error }, { status: 400 })
     }
+    const url = norm.url
 
-    // Fetch the target page HTML (server-side)
-    const res = await fetch(parsed.toString(), {
+    // Fetch page HTML
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 15000)
+    const res = await fetch(url, {
+      signal: controller.signal,
       headers: {
-        // More "browser-like" UA helps some sites respond with normal HTML
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
       },
       redirect: "follow",
     }).catch((e) => {
-      throw new Error(`Failed to fetch the URL: ${e?.message || "unknown error"}`)
+      throw new Error(`Failed to fetch URL: ${e?.message || "unknown error"}`)
     })
+    clearTimeout(timeout)
 
-    const finalUrl = res.url || parsed.toString()
-    const status = res.status
-    const contentType = res.headers.get("content-type") || ""
-    const isHTML = contentType.includes("text/html")
-    const rawHTML = isHTML ? await res.text() : ""
-
-    // Basic parsing with cheerio
-    const $ = cheerio.load(rawHTML || "")
-    const title = $("title").first().text().trim()
-    const metaDescription = $('meta[name="description"]').attr("content")?.trim() || ""
-    const h1Count = $("h1").length
-    const h2Count = $("h2").length
-    const linkCount = $("a").length
-    const buttonCount = $("button").length + $('a[role="button"]').length
-    const imagesMissingAlt = $("img").filter((_, el) => !($(el).attr("alt") || "").trim()).length
-    const forms = $("form").length
-    const robotsMeta = $('meta[name="robots"]').attr("content") || ""
-    const hasViewport = $('meta[name="viewport"]').length > 0
-    const textContent = $("body").text().replace(/\s+/g, " ").trim()
-    const sampleText = textContent.slice(0, 2000)
-
-    const htmlForLLM = rawHTML ? rawHTML.slice(0, 100_000) : "" // cap to keep token size reasonable
-
-    const context = {
-      url: parsed.toString(),
-      finalUrl,
-      status,
-      contentType,
-      title,
-      metaDescription,
-      h1Count,
-      h2Count,
-      linkCount,
-      buttonCount,
-      imagesMissingAlt,
-      forms,
-      robotsMeta,
-      hasViewport,
-      textSample: sampleText,
+    if (!res.ok) {
+      return NextResponse.json({ ok: false, error: `Unable to fetch ${url} (status ${res.status}).` }, { status: 400 })
     }
 
-    // Build the instruction and request strict JSON back
-    const system = [
-      "You are an expert ux auditor for websites. Using only this info, produce short reports by reviewing website and code.",
-      "Rules:",
-      "- Score 0-5: clarity, navigation, accessibility, credibility. (be liberal with rating)",
-      "- Up to 8 issues: {category, evidence, severity(low|medium|high), fix}.",
-      "- 5 prioritized actions (short, actionable).",
-      "- SEO Optimized Headline suggestions",
-      "- Button CTA suggestions (if any)",
-      "",
-      "Output must be a single JSON object matching this TypeScript type:",
-      "type AuditResult = {",
-      "  scores: { clarity: number; navigation: number; accessibility: number; credibility: number };",
-      '  issues: { category: string; evidence: string; severity: "low"|"medium"|"high"; fix: string }[];',
-      "  actions: string[]; // 5 items",
-      "  seo_headlines: string[]; // 3-8 items",
-      "  ctas: string[]; // 0-8 items",
-      "};",
-      "",
-      "Keep text concise. Use available context only. If info is missing, infer conservatively.",
-    ].join("\n")
+    const html = await res.text()
+    const htmlSnippet = truncateMiddle(html, MAX_HTML_CHARS)
+    const textSnippet = truncateMiddle(stripTags(html), MAX_HTML_CHARS)
 
-    const userPrompt = [
-      "Context about the scanned page:",
-      JSON.stringify(context, null, 2),
-      "",
-      "First 100k chars of HTML (may be truncated):",
-      "```html",
-      htmlForLLM || "[no html received]",
-      "```",
-      "",
-      "Return ONLY the JSON. No explanations.",
-    ].join("\n")
+    // Build strict JSON-instruction prompt
+    const system =
+      "You are an expert UX auditor for websites. Review the provided URL and HTML only. Be concise and pragmatic."
 
-    // Call the model using AI SDK
+    const schemaHint = `
+Return ONLY valid JSON matching this schema and nothing else (no code fences):
+
+{
+  "scores": { "clarity": number (0-5), "navigation": number (0-5), "accessibility": number (0-5), "credibility": number (0-5) },
+  "issues": Array<{ "category": string, "evidence": string, "severity": "low"|"medium"|"high", "fix": string }>, // up to 8
+  "actions": string[5], // 5 prioritized, short, actionable
+  "headlineSuggestions": string[], // SEO optimized headlines
+  "ctaSuggestions": string[] // Button CTA ideas
+}
+
+Rules:
+- Be liberal with scoring (use decimals allowed).
+- Ground issues in evidence from the HTML/text.
+- Keep outputs compact and scannable.
+- No markdown, no commentary. JSON only.
+`.trim()
+
+    const userPrompt = `
+URL: ${url}
+
+Short page text sample:
+"""${textSnippet}"""
+
+HTML sample:
+"""${htmlSnippet}"""
+
+Task:
+Using only the information above, produce a short UX audit of the landing page.
+
+- Score 0-5: clarity, navigation, accessibility, credibility (be liberal with rating).
+- Up to 8 issues: {category, evidence, severity(low|medium|high), fix}.
+- 5 prioritized actions (short, actionable).
+- SEO Optimized Headline suggestions.
+- Button CTA suggestions (if any).
+
+${schemaHint}
+`.trim()
+
+    // Call OpenAI via Vercel AI SDK
     const { text } = await generateText({
       model: openai("gpt-4o"),
       system,
       prompt: userPrompt,
     })
 
-    let modelJson: AuditResult
-    try {
-      modelJson = extractJson(text)
-    } catch (e) {
-      // Fallback minimal result if JSON parse fails
-      modelJson = {
-        scores: { clarity: 2, navigation: 2, accessibility: 2, credibility: 2 },
-        issues: [
-          {
-            category: "Parsing",
-            evidence: "Model returned non-JSON or malformed JSON.",
-            severity: "low",
-            fix: "Retry the audit or adjust prompt.",
-          },
-        ],
-        actions: ["Retry the audit"],
-        seo_headlines: [],
-        ctas: [],
-        context, // include context to aid debugging on client
-      } as unknown as AuditResult
-    }
-    // Attach context for client display (non-breaking extension to schema)
-    ;(modelJson as any).context = context
+    // Try to parse JSON, stripping common wrappers
+    const cleaned = text
+      .replace(/```json/gi, "")
+      .replace(/```/g, "")
+      .trim()
 
-    return NextResponse.json(modelJson, { status: 200 })
-  } catch (err: any) {
-    return NextResponse.json({ error: err?.message || "Internal error" }, { status: 500 })
+    let data: unknown | null = null
+    try {
+      data = JSON.parse(cleaned)
+    } catch {
+      // leave data as null; client will show raw
+    }
+
+    return NextResponse.json({
+      ok: true,
+      data,
+      raw: text,
+      fetchedUrl: url,
+    })
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: e?.message || "Server error." }, { status: 500 })
   }
 }
