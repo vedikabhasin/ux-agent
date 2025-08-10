@@ -1,138 +1,95 @@
-import { type NextRequest, NextResponse } from "next/server"
-import { generateText } from "ai"
-import { openai } from "@ai-sdk/openai"
-import { normalizeInputToUrl } from "@/lib/validation"
+import { NextResponse } from "next/server"
 
-const MAX_HTML_CHARS = 20000
-
-function stripTags(html: string): string {
+export async function POST(req: Request) {
   try {
-    // Remove scripts/styles and tags to get a rough text snapshot
-    const noScripts = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "")
-    const text = noScripts
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-    return text
-  } catch {
-    return ""
-  }
-}
+    const body = await req.json().catch(() => ({}))
+    const url = typeof body?.url === "string" ? body.url : ""
 
-function truncateMiddle(input: string, max: number): string {
-  if (input.length <= max) return input
-  const half = Math.floor(max / 2)
-  return input.slice(0, half) + "\n...[truncated]...\n" + input.slice(-half)
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json()
-    const input: string | undefined = body?.input
-    if (!input || typeof input !== "string") {
-      return NextResponse.json({ ok: false, error: "Missing input." }, { status: 400 })
+    if (!url) {
+      return NextResponse.json({ error: "Missing 'url' in request body" }, { status: 400 })
     }
 
-    const norm = normalizeInputToUrl(input)
-    if (!norm.ok) {
-      return NextResponse.json({ ok: false, error: norm.error }, { status: 400 })
-    }
-    const url = norm.url
-
-    // Fetch page HTML
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 15000)
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      },
-      redirect: "follow",
-    }).catch((e) => {
-      throw new Error(`Failed to fetch URL: ${e?.message || "unknown error"}`)
-    })
-    clearTimeout(timeout)
-
-    if (!res.ok) {
-      return NextResponse.json({ ok: false, error: `Unable to fetch ${url} (status ${res.status}).` }, { status: 400 })
-    }
-
-    const html = await res.text()
-    const htmlSnippet = truncateMiddle(html, MAX_HTML_CHARS)
-    const textSnippet = truncateMiddle(stripTags(html), MAX_HTML_CHARS)
-
-    // Build strict JSON-instruction prompt
-    const system =
-      "You are an expert UX auditor for websites. Review the provided URL and HTML only. Be concise and pragmatic."
-
-    const schemaHint = `
-Return ONLY valid JSON matching this schema and nothing else (no code fences):
-
-{
-  "scores": { "clarity": number (0-5), "navigation": number (0-5), "accessibility": number (0-5), "credibility": number (0-5) },
-  "issues": Array<{ "category": string, "evidence": string, "severity": "low"|"medium"|"high", "fix": string }>, // up to 8
-  "actions": string[5], // 5 prioritized, short, actionable
-  "headlineSuggestions": string[], // SEO optimized headlines
-  "ctaSuggestions": string[] // Button CTA ideas
-}
-
-Rules:
-- Be liberal with scoring (use decimals allowed).
-- Ground issues in evidence from the HTML/text.
-- Keep outputs compact and scannable.
-- No markdown, no commentary. JSON only.
-`.trim()
-
-    const userPrompt = `
-URL: ${url}
-
-Short page text sample:
-"""${textSnippet}"""
-
-HTML sample:
-"""${htmlSnippet}"""
-
-Task:
-Using only the information above, produce a short UX audit of the landing page.
-
-- Score 0-5: clarity, navigation, accessibility, credibility (be liberal with rating).
-- Up to 8 issues: {category, evidence, severity(low|medium|high), fix}.
-- 5 prioritized actions (short, actionable).
-- SEO Optimized Headline suggestions.
-- Button CTA suggestions (if any).
-
-${schemaHint}
-`.trim()
-
-    // Call OpenAI via Vercel AI SDK
-    const { text } = await generateText({
-      model: openai("gpt-4o"),
-      system,
-      prompt: userPrompt,
-    })
-
-    // Try to parse JSON, stripping common wrappers
-    const cleaned = text
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim()
-
-    let data: unknown | null = null
     try {
-      data = JSON.parse(cleaned)
+      // Basic validation
+      // eslint-disable-next-line no-new
+      new URL(url)
     } catch {
-      // leave data as null; client will show raw
+      return NextResponse.json({ error: "Invalid URL format" }, { status: 400 })
     }
 
-    return NextResponse.json({
-      ok: true,
-      data,
-      raw: text,
-      fetchedUrl: url,
-    })
-  } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || "Server error." }, { status: 500 })
+    // Dummy report data
+    const report = {
+      summary: `We performed a quick, dummy UX audit for ${url}. The findings below are mock data intended to demonstrate layout and flow.`,
+      scores: {
+        usability: 82,
+        accessibility: 76,
+        performance: 88,
+        content: 70,
+        trust: 65,
+        seo: 80,
+      },
+      issues: [
+        {
+          category: "Accessibility",
+          severity: "high",
+          evidence: "Insufficient color contrast between text and background on primary buttons.",
+          fix: "Increase contrast to meet WCAG AA (contrast ratio >= 4.5:1) or adjust color tokens.",
+        },
+        {
+          category: "Navigation",
+          severity: "medium",
+          evidence: "Mobile menu requires two taps to close after navigation.",
+          fix: "Close the menu automatically on route change and ensure focus is restored.",
+        },
+        {
+          category: "Content",
+          severity: "low",
+          evidence: "Some pages exceed recommended line length, reducing readability.",
+          fix: "Constrain line length to 60–80 characters using container widths or max-w classes.",
+        },
+        {
+          category: "Forms",
+          severity: "medium",
+          evidence: "Form fields lack explicit labels; placeholders are used as labels.",
+          fix: "Add <label> elements associated via htmlFor and inputs with unique ids.",
+        },
+        {
+          category: "Performance",
+          severity: "high",
+          evidence: "Large hero image not optimized; no width/height attributes set.",
+          fix: "Serve appropriately sized images and include explicit dimensions to avoid layout shift.",
+        },
+        {
+          category: "SEO",
+          severity: "low",
+          evidence: "Multiple pages missing meta description.",
+          fix: "Provide concise, unique meta descriptions per page (140–160 characters).",
+        },
+        {
+          category: "Trust",
+          severity: "medium",
+          evidence: "No visible privacy policy link in footer.",
+          fix: "Add a footer link to privacy policy and terms; surface trust badges where relevant.",
+        },
+      ],
+      prioritized_actions: [
+        "Fix high-contrast issues on primary actions to meet WCAG AA.",
+        "Optimize hero and large imagery with proper sizing and compression.",
+        "Add explicit labels to all form fields and ensure accessible names.",
+        "Auto-close mobile nav on route change and manage focus correctly.",
+        "Add unique meta descriptions and improve headings hierarchy.",
+      ],
+      seo_suggestions: [
+        "Ensure a single H1 per page and logical heading structure.",
+        "Add descriptive alt text to all meaningful images.",
+        "Provide unique, keyword-focused meta titles and descriptions.",
+        "Generate an XML sitemap and ensure it’s referenced in robots.txt.",
+        "Use structured data where applicable (e.g., BreadcrumbList).",
+      ],
+    }
+
+    return NextResponse.json({ report })
+  } catch (err) {
+    return NextResponse.json({ error: "Unexpected error" }, { status: 500 })
   }
 }
